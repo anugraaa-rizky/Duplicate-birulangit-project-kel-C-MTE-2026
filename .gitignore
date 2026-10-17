@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Database lokal (data hasil simulator / perangkat, dibuat otomatis saat backend jalan)
+*.db
+*.db-shm
+*.db-wal
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# Konfigurasi lokal & rahasia
+.env
+.env.local
+.env.*.local
+secrets.h
+credentials.h
+
+# Arduino build
+build/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
