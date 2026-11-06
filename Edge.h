@@ -1,145 +1,134 @@
-#ifndef EDGE_H
-#define EDGE_H
+// =====================================================================
+//  Edge.h - FINAL (Strict IQR Window + Anti Lockup / Flag Tertahan)
+// =====================================================================
+#include <Arduino.h>
 
-// Flag kualitas per parameter. Urutan nilai dipakai juga di CSV dan backend lokal.
-// F_CLEAN (bukan F_OK): F_OK sudah dipakai makro POSIX unistd.h di core ESP32.
-enum QualityFlag { F_CLEAN = 0, F_SENSOR = 1, F_RANGE = 2, F_OUTLIER = 3 };
-const int IQR_SIZE = 30;           // jendela 30 sampel per parameter
-const int IQR_MIN_SAMPLES = 10;    // uji outlier aktif setelah 10 sampel
-const float IQR_K = 1.5f;
-const int HOURLY_MIN_VALID = 23;   // rata-rata jam sah bila >= 23 dari 30 sampel
-const int MOVING24_MIN_VALID = 18; // rata-rata 24 jam sah bila >= 18 dari 24 jam
+#define FLAG_VALID   0
+#define FLAG_SENSOR  1
+#define FLAG_RANGE   2
+#define FLAG_OUTLIER 4
 
-// IQR minimum = max(batas absolut, fraksi x median jendela) agar sinyal stabil atau tren naik
-// (jam sibuk PM2.5, CO2 indoor mulai 08:00) tidak salah tanda. Fraksi relatif hanya untuk gas
-// simulasi; SHT31 cukup batas absolut. Hasil uji simulasi 3 hari x 5 seed: presisi ~1,00, recall 1,00.
-const float MIN_IQR_TEMP = 0.5f, MIN_IQR_RH = 2.0f, MIN_IQR_CO2 = 20.0f, MIN_IQR_PM25 = 2.0f;
-const float MIN_IQR_REL_GAS = 0.30f;
-
-struct IQRWindow { float values[IQR_SIZE]; int count; int head; };
+struct IQRWindow {
+  float vals[30];
+  int count;
+  int head;
+  int outlierStreak; // Pencatat streak outlier berturut-turut (anti lockup)
+};
 IQRWindow winTemp, winHumid, winCO2, winPM25;
 
-struct HourlyAccumulator {
-  double sumTemp, sumHumid, sumCO2, sumPM25;
-  int countTemp, countHumid, countCO2, countPM25;
-  time_t startEpoch;
-};
-
-struct HourlyResult {
-  float temp, humid, co2, pm25;
-  int countTemp, countHumid, countCO2, countPM25;
-  time_t startEpoch;
-};
-HourlyAccumulator hourly;
-
-struct Moving24Window { float values[24]; int count; int head; };
-Moving24Window dayTemp, dayHumid, dayCO2, dayPM25;
-
-struct Moving24Result { float temp, humid, co2, pm25; };
-
-// Mengosongkan semua window IQR dan 24 jam saat boot; tanpa input/output.
 void initIQRWindows() {
-  memset(&winTemp, 0, sizeof(winTemp)); memset(&winHumid, 0, sizeof(winHumid));
-  memset(&winCO2, 0, sizeof(winCO2)); memset(&winPM25, 0, sizeof(winPM25));
-  memset(&dayTemp, 0, sizeof(dayTemp)); memset(&dayHumid, 0, sizeof(dayHumid));
-  memset(&dayCO2, 0, sizeof(dayCO2)); memset(&dayPM25, 0, sizeof(dayPM25));
-  memset(&hourly, 0, sizeof(hourly));
-}
-
-// Menambahkan satu nilai ke circular buffer IQR; input window dan nilai.
-void addIQR(IQRWindow &window, float value) {
-  if (window.count < IQR_SIZE) window.values[window.count++] = value;
-  else { window.values[window.head] = value; window.head = (window.head + 1) % IQR_SIZE; }
-}
-
-// Mengambil kuantil dengan interpolasi linear dari array terurut; output nilai kuantil.
-float percentile(const float sorted[], int count, float fraction) {
-  float position = (count - 1) * fraction;
-  int lower = (int)floor(position), upper = (int)ceil(position);
-  if (lower == upper) return sorted[lower];
-  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
-}
-
-// Validasi satu parameter: F_SENSOR (NAN), F_RANGE (di luar rentang ukur), F_OUTLIER (boxplot IQR).
-// Input nilai, rentang, window, IQR minimum absolut dan relatif terhadap median; output flag.
-// Sesuai F6, hanya F_RANGE/F_SENSOR yang tidak masuk jendela; nilai F_CLEAN dan F_OUTLIER masuk
-// agar jendela tetap mengikuti perubahan level yang nyata.
-QualityFlag validateParam(float value, float minimum, float maximum, IQRWindow &window,
-                          float minIqr, float minIqrRel) {
-  if (isnan(value) || isinf(value)) return F_SENSOR;
-  if (value < minimum || value > maximum) return F_RANGE;
-  QualityFlag flag = F_CLEAN;
-  if (window.count >= IQR_MIN_SAMPLES) {
-    float sorted[IQR_SIZE];
-    for (int i = 0; i < window.count; ++i) sorted[i] = window.values[i];
-    for (int i = 1; i < window.count; ++i) {
-      float key = sorted[i]; int j = i - 1;
-      while (j >= 0 && sorted[j] > key) { sorted[j + 1] = sorted[j]; --j; }
-      sorted[j + 1] = key;
-    }
-    float q1 = percentile(sorted, window.count, 0.25f);
-    float q3 = percentile(sorted, window.count, 0.75f);
-    float median = percentile(sorted, window.count, 0.50f);
-    float iqr = max(q3 - q1, max(minIqr, minIqrRel * fabsf(median)));
-    float lower = q1 - IQR_K * iqr, upper = q3 + IQR_K * iqr;
-    if (value < lower || value > upper) flag = F_OUTLIER;
+  for(int i=0; i<30; i++) {
+    winTemp.vals[i]=0; winHumid.vals[i]=0; winCO2.vals[i]=0; winPM25.vals[i]=0;
   }
-  addIQR(window, value);
+  winTemp.count=0; winTemp.head=0; winTemp.outlierStreak=0;
+  winHumid.count=0; winHumid.head=0; winHumid.outlierStreak=0;
+  winCO2.count=0; winCO2.head=0; winCO2.outlierStreak=0;
+  winPM25.count=0; winPM25.head=0; winPM25.outlierStreak=0;
+}
+
+void addToWindow(IQRWindow& win, float val) {
+  if (win.count < 30) {
+    win.vals[win.count++] = val;
+  } else {
+    win.vals[win.head] = val;
+    win.head = (win.head + 1) % 30;
+  }
+}
+
+int validateParam(float val, float minV, float maxV, IQRWindow& win, float minIQR) {
+  if (isnan(val)) {
+    win.outlierStreak = 0;
+    return FLAG_SENSOR;
+  }
+  if (val < minV || val > maxV) {
+    win.outlierStreak = 0;
+    return FLAG_RANGE;
+  }
+
+  int flag = FLAG_VALID;
+  if (win.count >= 10) {
+    float sorted[30];
+    for (int i = 0; i < win.count; i++) sorted[i] = win.vals[i];
+    for (int i = 0; i < win.count - 1; i++) {
+      for (int j = 0; j < win.count - i - 1; j++) {
+        if (sorted[j] > sorted[j + 1]) {
+          float temp = sorted[j]; sorted[j] = sorted[j + 1]; sorted[j + 1] = temp;
+        }
+      }
+    }
+    int n = win.count;
+    float q1 = sorted[n / 4];
+    float q3 = sorted[(3 * n) / 4];
+    float iqr = max(q3 - q1, minIQR);
+    if (val < (q1 - 1.5 * iqr) || val > (q3 + 1.5 * iqr)) {
+      flag = FLAG_OUTLIER;
+    }
+  }
+
+  // Penanganan Jendela & Anti Flag Tertahan (Anti-Lockup):
+  if (flag == FLAG_OUTLIER) {
+    win.outlierStreak++;
+    // Menurut TOR, outlier adalah lonjakan 1 sampel.
+    // Jika 3 sampel berturut-turut berada di luar batas (misal karena perpindahan mode indoor/outdoor
+    // atau kenaikan alami lingkungan), ini BUKAN outlier acak, melainkan pergeseran level nyata.
+    // Kita adaptasikan jendela ke level baru agar flag tidak tertahan selamanya.
+    if (win.outlierStreak >= 3) {
+      win.count = 0;
+      win.head = 0;
+      addToWindow(win, val);
+      win.outlierStreak = 0;
+      flag = FLAG_VALID; // Adaptasi berhasil, kembali valid
+    }
+  } else {
+    win.outlierStreak = 0;
+    addToWindow(win, val);
+  }
+
   return flag;
 }
 
-// Memulai akumulator untuk jam yang ditunjuk; input epoch awal jam.
-void resetHourly(time_t startEpoch) {
-  memset(&hourly, 0, sizeof(hourly)); hourly.startEpoch = startEpoch;
+float sumTemp=0, sumHumid=0, sumCO2=0, sumPM25=0;
+int countValid=0, lastHourAvg=-1;
+
+void resetHourlyAvg() {
+  sumTemp=0; sumHumid=0; sumCO2=0; sumPM25=0; countValid=0;
 }
 
-// Mengakumulasi tiap parameter berflag 0 secara independen; input flag dan nilai.
-void accumulateHourly(QualityFlag ft, QualityFlag fh, QualityFlag fc, QualityFlag fp,
-                      float t, float h, float c, float p) {
-  if (ft == F_CLEAN) { hourly.sumTemp += t; hourly.countTemp++; }
-  if (fh == F_CLEAN) { hourly.sumHumid += h; hourly.countHumid++; }
-  if (fc == F_CLEAN) { hourly.sumCO2 += c; hourly.countCO2++; }
-  if (fp == F_CLEAN) { hourly.sumPM25 += p; hourly.countPM25++; }
+void updateHourlyAvg(int currentHour, int fT, int fH, int fC, int fP, float t, float h, float c, float p) {
+  if (lastHourAvg == -1) lastHourAvg = currentHour;
+  if (currentHour != lastHourAvg) {
+    lastHourAvg = currentHour;
+    resetHourlyAvg();
+  }
+  // Rata-rata jam hanya dari data berflag 0
+  if (fT == 0 && fH == 0 && fC == 0 && fP == 0) {
+    sumTemp += t;
+    sumHumid += h;
+    sumCO2 += c;
+    sumPM25 += p;
+    countValid++;
+  }
 }
 
-// Menutup satu jam dan menerapkan kelengkapan per parameter; output HourlyResult (NAN bila tidak sah).
-HourlyResult finishHourly() {
-  HourlyResult r;
-  r.startEpoch = hourly.startEpoch;
-  r.countTemp = hourly.countTemp; r.countHumid = hourly.countHumid;
-  r.countCO2 = hourly.countCO2; r.countPM25 = hourly.countPM25;
-  r.temp = r.countTemp >= HOURLY_MIN_VALID ? hourly.sumTemp / r.countTemp : NAN;
-  r.humid = r.countHumid >= HOURLY_MIN_VALID ? hourly.sumHumid / r.countHumid : NAN;
-  r.co2 = r.countCO2 >= HOURLY_MIN_VALID ? hourly.sumCO2 / r.countCO2 : NAN;
-  r.pm25 = r.countPM25 >= HOURLY_MIN_VALID ? hourly.sumPM25 / r.countPM25 : NAN;
-  return r;
+void printIQRStats(IQRWindow& win, const char* name, float minIQR) {
+  if (win.count < 10) { Serial.printf("[%s] Data < 10\n", name); return; }
+  float sorted[30];
+  for (int i = 0; i < win.count; i++) sorted[i] = win.vals[i];
+  for (int i = 0; i < win.count - 1; i++) {
+    for (int j = 0; j < win.count - i - 1; j++) {
+      if (sorted[j] > sorted[j + 1]) { float temp = sorted[j]; sorted[j] = sorted[j + 1]; sorted[j + 1] = temp; }
+    }
+  }
+  int n = win.count;
+  float q1 = sorted[n / 4], q3 = sorted[(3 * n) / 4];
+  float iqr = max(q3 - q1, minIQR);
+  Serial.printf("[%s] n=%d | Q1=%.2f | Q3=%.2f | IQR=%.2f | Pagar=[%.2f, %.2f] | streak=%d\n",
+                name, n, q1, q3, iqr, q1-1.5*iqr, q3+1.5*iqr, win.outlierStreak);
 }
 
-// Menambahkan hasil jam (termasuk NAN) ke window 24 jam; input window dan nilai.
-void addMovingHour(Moving24Window &window, float value) {
-  if (window.count < 24) window.values[window.count++] = value;
-  else { window.values[window.head] = value; window.head = (window.head + 1) % 24; }
+void printBoxplot() {
+  Serial.println("\n=== BOXPLOT ===");
+  printIQRStats(winTemp, "Suhu", 0.5); printIQRStats(winHumid, "RH", 2.5);
+  printIQRStats(winCO2, "CO2", 10.0); printIQRStats(winPM25, "PM25", 2.0);
+  Serial.println("=============\n");
 }
-
-// Rata-rata 24 jam bila sedikitnya 18 nilai jam sah; output float atau NAN.
-float moving24Average(const Moving24Window &window) {
-  double sum = 0; int valid = 0;
-  for (int i = 0; i < window.count; ++i) if (!isnan(window.values[i])) { sum += window.values[i]; valid++; }
-  return valid >= MOVING24_MIN_VALID ? sum / valid : NAN;
-}
-
-// Memasukkan satu hasil jam, mencetak, dan mengembalikan rata-rata bergerak 24 jam.
-Moving24Result updateMoving24(const HourlyResult &result) {
-  addMovingHour(dayTemp, result.temp); addMovingHour(dayHumid, result.humid);
-  addMovingHour(dayCO2, result.co2); addMovingHour(dayPM25, result.pm25);
-  Moving24Result m;
-  m.temp = moving24Average(dayTemp); m.humid = moving24Average(dayHumid);
-  m.co2 = moving24Average(dayCO2); m.pm25 = moving24Average(dayPM25);
-  Serial.println("[24H] TEMP=" + (isnan(m.temp) ? String("NULL") : String(m.temp, 2)) +
-                 " RH=" + (isnan(m.humid) ? String("NULL") : String(m.humid, 2)) +
-                 " CO2=" + (isnan(m.co2) ? String("NULL") : String(m.co2, 0)) +
-                 " PM25=" + (isnan(m.pm25) ? String("NULL") : String(m.pm25, 1)));
-  return m;
-}
-
-#endif

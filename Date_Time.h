@@ -1,100 +1,86 @@
-#ifndef DATE_TIME_H
-#define DATE_TIME_H
-
+// =====================================================================
+//  Date_Time.h - FINAL (RTC + Sync + Format Waktu + DayKey TOR)
+// =====================================================================
 #include <time.h>
 
-// Selisih WIB terhadap UTC. RTC menyimpan jam dinding WIB, jadi epoch UTC = epoch RTC - WIB_OFFSET.
-const long WIB_OFFSET = 7L * 3600L;
-
-// Indeks waktu satu slot (F4): dayKey YYYYMMDD, jam, menit, dan menit ke-n dalam sehari.
-struct TimeIndex { String dayKey; int hour; int minute; int minOfDay; };
-
-// Membentuk TimeIndex dari epoch lokal WIB; input epoch, output struct TimeIndex.
-TimeIndex buildTimeIndex(time_t value) {
-  struct tm t;
-  gmtime_r(&value, &t);
-  char key[9];
-  snprintf(key, sizeof(key), "%04d%02d%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
-  TimeIndex idx;
-  idx.dayKey = String(key);
-  idx.hour = t.tm_hour;
-  idx.minute = t.tm_min;
-  idx.minOfDay = t.tm_hour * 60 + t.tm_min;
-  return idx;
+String get_date_time(int choose) {
+  char buf[20];
+  if (choose == 1)
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", rtc.getYear(), rtc.getMonth() + 1, rtc.getDay());
+  else if (choose == 2)
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
+  else
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", rtc.getYear(), rtc.getMonth() + 1, rtc.getDay(), rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
+  return String(buf);
 }
 
-// Menghasilkan tanggal RTC saat ini dalam format YYYYMMDD; tanpa input, output String.
-String getDayKey() {
-  return buildTimeIndex(rtc.getEpoch()).dayKey;
+String get_slot_time() {
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:00",
+           rtc.getYear(), rtc.getMonth() + 1, rtc.getDay(),
+           rtc.getHour(true), rtc.getMinute());
+  return String(buf);
 }
 
-// Memformat epoch lokal WIB sebagai YYYY-MM-DD HH:MM:SS; input epoch, output String.
-String formatEpoch(time_t value) {
-  struct tm valueTm;
-  gmtime_r(&value, &valueTm);
-  char out[20];
-  strftime(out, sizeof(out), "%Y-%m-%d %H:%M:%S", &valueTm);
-  return String(out);
+// Format dayKey (YYYYMMDD) sesuai ketentuan TOR F4 & F7
+String get_day_key() {
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%04d%02d%02d", rtc.getYear(), rtc.getMonth() + 1, rtc.getDay());
+  return String(buf);
 }
 
-// Menghasilkan timestamp RTC saat ini; tanpa input, output String.
-String getDateTime() {
-  return formatEpoch(rtc.getEpoch());
+// Menghitung timestamp awal jam (created_at) dan dayKey (YYYYMMDD) untuk rata-rata jam yang baru selesai.
+// Karena rata-rata jam ditutup pada awal jam baru (HH:00) — misalnya jam 23:00-23:58 ditutup pada 00:00 keesokan harinya —
+// mundur 1800 detik (30 menit) secara matematis selalu jatuh tepat di tengah jam yang dirata-rata.
+// Penggunaan localtime_r menangani pergantian hari, bulan, tahun, dan tahun kabisat secara akurat tanpa bug tanggal.
+void get_hourly_avg_time(String &outCreatedAt, String &outDayKey) {
+  time_t pastEpoch = rtc.getEpoch() - 1800;
+  struct tm ti;
+  localtime_r(&pastEpoch, &ti);
+
+  char timeBuf[25];
+  snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02d %02d:00:00",
+           ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday, ti.tm_hour);
+  outCreatedAt = String(timeBuf);
+
+  char dayBuf[12];
+  snprintf(dayBuf, sizeof(dayBuf), "%04d%02d%02d",
+           ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
+  outDayKey = String(dayBuf);
 }
 
-// Menghasilkan uptime HH:MM:SS (jam minimal dua digit, boleh > 24); output String.
-String getUptime() {
-  unsigned long seconds = millis() / 1000UL;
-  char out[20];
-  snprintf(out, sizeof(out), "%02lu:%02lu:%02lu", seconds / 3600UL,
-           (seconds % 3600UL) / 60UL, seconds % 60UL);
-  return String(out);
+String get_uptime() {
+  unsigned long totalSeconds = millis() / 1000;
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
+           totalSeconds / 3600, (totalSeconds % 3600) / 60, totalSeconds % 60);
+  return String(buf);
 }
 
-// Memvalidasi field datetime dari JSON server lalu menerapkannya ke RTC.
-// Input payload JSON; output true bila valid, serverDateTime berisi teks waktu server.
-bool setRtcFromJson(const String &payload, String &serverDateTime) {
-  int key = payload.indexOf("\"datetime\"");
-  if (key < 0) return false;
-  int colon = payload.indexOf(':', key);
-  int quote = payload.indexOf('"', colon + 1);
-  if (colon < 0 || quote < 0 || quote + 20 > (int)payload.length()) return false;
-  serverDateTime = payload.substring(quote + 1, quote + 20);
-  if (serverDateTime.length() != 19 || serverDateTime.charAt(4) != '-' ||
-      serverDateTime.charAt(7) != '-' || serverDateTime.charAt(10) != ' ' ||
-      serverDateTime.charAt(13) != ':' || serverDateTime.charAt(16) != ':') return false;
-  int year = serverDateTime.substring(0, 4).toInt();
-  int month = serverDateTime.substring(5, 7).toInt();
-  int day = serverDateTime.substring(8, 10).toInt();
-  int hour = serverDateTime.substring(11, 13).toInt();
-  int minute = serverDateTime.substring(14, 16).toInt();
-  int second = serverDateTime.substring(17, 19).toInt();
-  if (year < 2025 || month < 1 || month > 12 || day < 1 || day > 31 ||
-      hour > 23 || minute > 59 || second > 59) return false;
-  rtc.setTime(second, minute, hour, day, month, year);
+bool setRtcFromJson(const String &payload) {
+  int k = payload.indexOf("\"datetime\":");
+  if (k == -1) return false;
+  int a = payload.indexOf("\"", k + 11) + 1;
+  String d = payload.substring(a, a + 19);
+  if (d.length() != 19) return false;
+  rtc.setTime(d.substring(17, 19).toInt(), d.substring(14, 16).toInt(), d.substring(11, 13).toInt(),
+              d.substring(8, 10).toInt(), d.substring(5, 7).toInt(), d.substring(0, 4).toInt());
   return true;
 }
 
-// Mengambil waktu WIB dari /api/get-time (F3); tanpa input, output true bila HTTP 200 dan parsing sah.
-bool syncRtc() {
-  if (WiFi.status() != WL_CONNECTED || secureClient == nullptr) return false;
+bool Sync_RTC() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (client.connected()) client.stop();
   HTTPClient https;
-  unsigned long started = millis();
-  int httpCode = -1;
-  String dateTime = "";
+  if (!https.begin(client, api_time)) return false;
+  https.setUserAgent(group_name);
+  https.setTimeout(8000);
+  unsigned long t0 = millis(); int code = https.GET(); unsigned long rtt = millis() - t0;
   bool ok = false;
-  if (https.begin(*secureClient, api_time)) {
-    https.setTimeout(5000);
-    https.setUserAgent(group_name);
-    httpCode = https.GET();
-    if (httpCode == 200) ok = setRtcFromJson(https.getString(), dateTime);
-    https.end();
+  if (code >= 200 && code <= 299) {
+    ok = setRtcFromJson(https.getString());
   }
-  Serial.printf("[RTC] HTTP=%d\n", httpCode);
-  if (dateTime.length()) Serial.println("[RTC] server=" + dateTime);
-  if (ok) Serial.println("[RTC] rtc=" + getDateTime());
-  Serial.printf("[RTC] RTT=%lu ms status=%s\n", millis() - started, ok ? "OK" : "GAGAL");
+  https.end();
+  Serial.printf("[RTC] %s kode=%d RTT=%lu ms\n", get_date_time(0).c_str(), code, rtt);
   return ok;
 }
-
-#endif
